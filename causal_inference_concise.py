@@ -69,13 +69,15 @@ class CausalInterventionAnalyzer:
         Estimate causal effect of salary increase using G-computation.
         
         Args:
-            X: Employee features
+            X: Employee features (raw data before preprocessing)
             increase_pct: Salary increase (0.15 = 15%)
             horizon: Time horizon in days
             
         Returns:
             InterventionEffect with ATE, ITE, and confidence intervals
         """
+        X = X.copy()
+        
         # Check for confounders
         available_confounders = [c for c in self.SALARY_CONFOUNDERS if c in X.columns]
         if len(available_confounders) < 5:
@@ -124,12 +126,14 @@ class CausalInterventionAnalyzer:
         Estimate causal effect of promotion using G-computation.
         
         Args:
-            X: Employee features
+            X: Employee features (raw data before preprocessing)
             horizon: Time horizon in days
             
         Returns:
             InterventionEffect with causal estimates
         """
+        X = X.copy()
+        
         # Check confounders
         available_confounders = [c for c in self.PROMOTION_CONFOUNDERS if c in X.columns]
         if len(available_confounders) < 5:
@@ -173,136 +177,149 @@ class CausalInterventionAnalyzer:
         
         Note: X should be raw features - preprocessing happens inside predict_survival_curves
         """
-        survival_curves = self.model_engine.predict_survival_curves(
-            X, time_points=np.array([horizon])
-        )
-        return 1 - survival_curves[:, 0]  # Risk = 1 - Survival
+        try:
+            survival_curves = self.model_engine.predict_survival_curves(
+                X, time_points=np.array([horizon])
+            )
+            return 1 - survival_curves[:, 0]  # Risk = 1 - Survival
+        except Exception as e:
+            logger.error(f"Failed to predict survival curves: {e}")
+            raise
     
     def _apply_salary_increase(self, X: pd.DataFrame, increase_pct: float) -> pd.DataFrame:
         """Apply salary increase intervention to RAW features
         
-        Important: Modifies raw features that will be transformed by the preprocessing pipeline
+        Modifies both direct salary features and related compensation metrics
         """
         X_modified = X.copy()
         
-        # Direct salary features (raw, before winsorization)
+        # Direct salary features (numeric)
         if 'baseline_salary' in X_modified.columns:
             X_modified['baseline_salary'] *= (1 + increase_pct)
         
+        if 'avg_salary_last_quarter' in X_modified.columns:
+            X_modified['avg_salary_last_quarter'] *= (1 + increase_pct)
+        
+        # Salary growth features (numeric)
         if 'salary_growth_rate_12m' in X_modified.columns:
-            # Ensure growth rate reflects the increase
-            X_modified['salary_growth_rate_12m'] = np.maximum(
-                X_modified['salary_growth_rate_12m'], increase_pct
+            current_growth = X_modified['salary_growth_rate_12m']
+            X_modified['salary_growth_rate_12m'] = np.where(
+                pd.isna(current_growth), 
+                increase_pct,
+                np.maximum(current_growth, increase_pct)
             )
         
-        # Update salary growth to CPL rate if it exists
         if 'salary_growth_rate12m_to_cpl_rate' in X_modified.columns:
-            # This would need recalculation based on new salary
             X_modified['salary_growth_rate12m_to_cpl_rate'] *= (1 + increase_pct)
         
-        # Percentile improvements (will be recalculated in ideal world, but we approximate)
+        # Compensation percentiles (numeric) - approximate impact
         if 'compensation_percentile_company' in X_modified.columns:
-            # Move up in percentile due to salary increase
-            current_percentile = X_modified['compensation_percentile_company']
-            # Approximate: 15% salary increase might move someone up 10-15 percentile points
-            X_modified['compensation_percentile_company'] = np.minimum(
-                current_percentile + (increase_pct * 100 * 0.67), 95
-            )
+            current = X_modified['compensation_percentile_company']
+            # 15% raise might move someone up ~10 percentile points
+            X_modified['compensation_percentile_company'] = np.minimum(current + increase_pct * 67, 95)
         
         if 'compensation_percentile_industry' in X_modified.columns:
-            current_percentile = X_modified['compensation_percentile_industry']
-            X_modified['compensation_percentile_industry'] = np.minimum(
-                current_percentile + (increase_pct * 100 * 0.67), 95
-            )
+            current = X_modified['compensation_percentile_industry']
+            X_modified['compensation_percentile_industry'] = np.minimum(current + increase_pct * 67, 95)
         
-        # Peer comparison improvements
+        # Peer comparison ratios (numeric)
         if 'peer_salary_ratio' in X_modified.columns:
-            # Higher salary improves ratio vs peers
             X_modified['peer_salary_ratio'] *= (1 + increase_pct)
         
         if 'sal_nghb_ratio' in X_modified.columns:
-            # Salary neighborhood ratio improvement
             X_modified['sal_nghb_ratio'] *= (1 + increase_pct)
         
-        # Team average comp might change if this person is included
+        # Team average compensation (indirect effect)
         if 'team_avg_comp' in X_modified.columns and 'team_size' in X_modified.columns:
-            # Approximate: assume this person's increase affects team average
             team_size = X_modified['team_size'].fillna(10)
-            team_avg = X_modified['team_avg_comp']
-            # New team average after this person's raise
             if 'baseline_salary' in X_modified.columns:
-                old_salary = X_modified['baseline_salary'] / (1 + increase_pct)
-                new_salary = X_modified['baseline_salary']
-                X_modified['team_avg_comp'] = team_avg + (new_salary - old_salary) / team_size
+                salary_increase = X_modified['baseline_salary'] * increase_pct
+                X_modified['team_avg_comp'] += salary_increase / team_size
         
-        # Reduce compensation volatility (salary increase stabilizes comp)
+        # Compensation volatility reduces after raise (numeric)
         if 'compensation_volatility' in X_modified.columns:
             X_modified['compensation_volatility'] *= 0.7
-        
-        # Update average salary last quarter
-        if 'avg_salary_last_quarter' in X_modified.columns:
-            X_modified['avg_salary_last_quarter'] *= (1 + increase_pct)
         
         return X_modified
     
     def _apply_promotion(self, X: pd.DataFrame) -> pd.DataFrame:
         """Apply promotion intervention to RAW features
         
-        Important: Modifies raw features before preprocessing pipeline
+        Handles both categorical (job_level) and numeric features
         """
         X_modified = X.copy()
         
-        # Job level changes (raw feature)
+        # Job level - categorical but with numeric-like values ('1', '2', '3')
         if 'job_level' in X_modified.columns:
-            X_modified['job_level'] = np.minimum(X_modified['job_level'] + 1, 10)
+            def increment_job_level(level):
+                if pd.isna(level):
+                    return level
+                try:
+                    # Try to convert to int and increment
+                    current = int(level)
+                    return str(min(current + 1, 10))
+                except:
+                    # If not numeric, leave as is
+                    return level
+            
+            X_modified['job_level'] = X_modified['job_level'].apply(increment_job_level)
         
-        # Reset promotion timing features (these are raw)
+        # Career stage progression - categorical
+        if 'career_stage' in X_modified.columns:
+            stage_mapping = {'Early': 'Mid', 'Mid': 'Senior', 'Senior': 'Senior'}
+            X_modified['career_stage'] = X_modified['career_stage'].map(
+                lambda x: stage_mapping.get(x, x) if pd.notna(x) else x
+            )
+        
+        # Promotion timing features (numeric)
         if 'time_since_last_promotion' in X_modified.columns:
             X_modified['time_since_last_promotion'] = 0
         
         if 'days_since_promot' in X_modified.columns:
             X_modified['days_since_promot'] = 0
         
-        # Update promotion indicators
+        # Promotion indicators (numeric 0/1)
         if 'promot_2yr_ind' in X_modified.columns:
             X_modified['promot_2yr_ind'] = 1
         
         if 'promot_2yr_titlechng_ind' in X_modified.columns:
             X_modified['promot_2yr_titlechng_ind'] = 1
         
+        if 'promot_2yr_perf_ind' in X_modified.columns:
+            X_modified['promot_2yr_perf_ind'] = 1
+        
+        if 'promot_2yr_mktadjst_ind' in X_modified.columns:
+            X_modified['promot_2yr_mktadjst_ind'] = 1
+        
+        # Promotion count (numeric)
         if 'num_promot_2yr' in X_modified.columns:
             X_modified['num_promot_2yr'] = np.minimum(X_modified['num_promot_2yr'] + 1, 3)
         
-        # Increase promotion velocity
+        # Promotion velocity (numeric)
         if 'promotion_velocity' in X_modified.columns:
             X_modified['promotion_velocity'] *= 1.5
         
-        # Reset stagnation indicators
+        # Reset stagnation (numeric)
         if 'pay_grade_stagnation_months' in X_modified.columns:
             X_modified['pay_grade_stagnation_months'] = 0
         
-        # Increase role complexity (promotion = more responsibility)
+        # Role complexity increases with promotion (numeric)
         if 'role_complexity_score' in X_modified.columns:
-            # Raw feature before log transformation
             X_modified['role_complexity_score'] = np.minimum(
                 X_modified['role_complexity_score'] * 1.2, 5
             )
         
-        # Update tenure in current role (reset on promotion)
+        # Reset tenure in current role (numeric)
         if 'tenure_in_current_role' in X_modified.columns:
             X_modified['tenure_in_current_role'] = 0
         
-        # Career progression indicators
-        if 'career_joiner_stage' in X_modified.columns:
-            # This might need more complex logic based on the encoding
-            pass
+        # Job change indicators (numeric)
+        if 'job_chng_2yr_ind' in X_modified.columns:
+            X_modified['job_chng_2yr_ind'] = 1
         
-        if 'career_stage' in X_modified.columns:
-            # Potentially move up career stage
-            stage_mapping = {'Early': 'Mid', 'Mid': 'Senior', 'Senior': 'Senior'}
-            X_modified['career_stage'] = X_modified['career_stage'].map(
-                lambda x: stage_mapping.get(x, x)
-            )
+        # Demotion indicator reset (numeric)
+        if 'demot_2yr_ind' in X_modified.columns:
+            X_modified['demot_2yr_ind'] = 0
         
         return X_modified
 
@@ -327,27 +344,30 @@ if __name__ == "__main__":
                     curves[i, j] = base_survival * np.exp(-0.001 * time_points[j] * np.random.uniform(0.5, 1.5))
             return curves
     
-    # Create test data with actual feature names
+    # Create test data with actual feature names and types
     np.random.seed(42)
     n_samples = 1000
     
     test_data = pd.DataFrame({
+        # Numeric features
         'baseline_salary': np.random.uniform(40000, 150000, n_samples),
         'age_at_vantage': np.random.uniform(22, 65, n_samples),
         'tenure_at_vantage_days': np.random.uniform(30, 3650, n_samples),
-        'job_level': np.random.randint(1, 8, n_samples),
         'compensation_percentile_company': np.random.uniform(10, 90, n_samples),
         'time_since_last_promotion': np.random.uniform(0, 1825, n_samples),
         'promotion_velocity': np.random.uniform(0.1, 2.0, n_samples),
-        'career_stage': np.random.choice(['Early', 'Mid', 'Senior'], n_samples),
-        'gender_cd': np.random.choice(['M', 'F'], n_samples),
-        'naics_cd': np.random.choice(['23', '31', '52', '54'], n_samples),
         'team_avg_comp': np.random.uniform(50000, 120000, n_samples),
         'peer_salary_ratio': np.random.uniform(0.8, 1.2, n_samples),
         'compensation_volatility': np.random.uniform(0, 0.3, n_samples),
         'days_since_promot': np.random.uniform(0, 1825, n_samples),
-        'promot_2yr_ind': np.random.choice([0, 1], n_samples),
-        'role_complexity_score': np.random.uniform(1, 5, n_samples)
+        'promot_2yr_ind': np.random.choice([0, 1], n_samples),  # Numeric 0/1
+        'role_complexity_score': np.random.uniform(1, 5, n_samples),
+        'team_size': np.random.uniform(3, 20, n_samples),
+        # Categorical features
+        'job_level': np.random.choice(['1', '2', '3', '4', '5', '6'], n_samples),  # String
+        'career_stage': np.random.choice(['Early', 'Mid', 'Senior'], n_samples),
+        'gender_cd': np.random.choice(['M', 'F'], n_samples),
+        'naics_cd': np.random.choice(['23', '31', '52', '54'], n_samples),
     })
     
     # Initialize analyzer
@@ -377,17 +397,16 @@ if __name__ == "__main__":
     print(f"Statistically significant: {promotion_effect.significant}")
     print(f"Responders: {promotion_effect.responders_pct:.1f}% would benefit")
     
-    print("\n3. Individual Treatment Effects Distribution:")
+    print("\n3. Verifying Feature Modifications:")
     print("-" * 50)
     
-    print(f"Salary ITE - Min: {salary_effect.ite_array.min():.3%}, Max: {salary_effect.ite_array.max():.3%}")
-    print(f"Promotion ITE - Min: {promotion_effect.ite_array.min():.3%}, Max: {promotion_effect.ite_array.max():.3%}")
+    # Test salary intervention
+    X_sal = analyzer._apply_salary_increase(test_data.head(1).copy(), 0.15)
+    print(f"Baseline salary: ${test_data.iloc[0]['baseline_salary']:.0f} -> ${X_sal.iloc[0]['baseline_salary']:.0f}")
     
-    # Identify who benefits most
-    high_benefit_idx = np.argmax(salary_effect.ite_array)
-    print(f"\nEmployee who benefits most from salary increase:")
-    print(f"  Current salary: ${test_data.iloc[high_benefit_idx]['baseline_salary']:.0f}")
-    print(f"  Tenure: {test_data.iloc[high_benefit_idx]['tenure_at_vantage_days']:.0f} days")
-    print(f"  Risk reduction: {salary_effect.ite_array[high_benefit_idx]:.3%}")
+    # Test promotion intervention
+    X_prom = analyzer._apply_promotion(test_data.head(1).copy())
+    print(f"Job level: {test_data.iloc[0]['job_level']} -> {X_prom.iloc[0]['job_level']}")
+    print(f"Career stage: {test_data.iloc[0]['career_stage']} -> {X_prom.iloc[0]['career_stage']}")
     
     print("\n=== TEST COMPLETED SUCCESSFULLY ===")
