@@ -77,29 +77,37 @@ class IndividualDriverAnalyzer:
         Analyze turnover risk drivers for an individual employee.
         
         Args:
-            employee_data: Single employee's features
+            employee_data: Single employee's RAW features (before preprocessing)
             n_drivers: Number of top drivers to return
             
         Returns:
             RiskDrivers object with analysis results
         """
-        # Get current risk
+        # Get current risk - model handles preprocessing internally
         employee_df = pd.DataFrame([employee_data])
         risk_score = self.model_engine.predict_risk_scores(employee_df)[0]
         risk_category = self._categorize_risk(risk_score)
         
         # Calculate feature contributions using permutation
-        contributions = self._calculate_feature_contributions(employee_df)
+        # Note: We need to get the processed features to know which ones matter
+        processed_df = self.model_engine._get_processed_features(employee_df)
+        contributions = self._calculate_feature_contributions(employee_df, processed_df)
+        
+        # Map contributions back to original features
+        original_contributions = self._map_to_original_features(contributions)
         
         # Separate risk and protective factors
         risk_factors = []
         protective_factors = []
         
-        for feature, contrib_value in contributions.items():
+        for feature, contrib_value in original_contributions.items():
+            # Get original feature value from raw data
+            value = employee_data.get(feature) if feature in employee_data.index else None
+            
             factor = {
                 'feature': feature,
                 'display_name': self.FEATURE_DISPLAY_NAMES.get(feature, feature.replace('_', ' ').title()),
-                'value': employee_data.get(feature),
+                'value': value,
                 'contribution': contrib_value,
                 'modifiable': feature in self.MODIFIABLE_FEATURES
             }
@@ -127,42 +135,78 @@ class IndividualDriverAnalyzer:
             intervention_recommendations=recommendations
         )
     
-    def _calculate_feature_contributions(self, employee_df: pd.DataFrame) -> Dict[str, float]:
+    def _calculate_feature_contributions(self, employee_df: pd.DataFrame, 
+                                        processed_df: pd.DataFrame) -> Dict[str, float]:
         """
-        Calculate feature contributions using permutation approach.
+        Calculate feature contributions using permutation approach on processed features.
+        
+        Args:
+            employee_df: Raw employee data
+            processed_df: Processed features after pipeline
         """
         baseline_risk = self.model_engine.predict_risk_scores(employee_df)[0]
         contributions = {}
         
-        # Get feature importance from model if available
-        if hasattr(self.model_engine, 'feature_importance'):
-            important_features = self.model_engine.feature_importance['feature'].tolist()[:30]
-        else:
-            important_features = employee_df.columns.tolist()
+        # Get the actual processed feature columns
+        processed_features = processed_df.columns.tolist()
         
-        for feature in important_features:
-            if feature not in employee_df.columns:
-                continue
+        # Calculate contributions for processed features
+        for feature in processed_features:
             if feature in ['survival_time_days', 'event_indicator_vol', 'dataset_split']:
                 continue
             
-            # Create permuted version
+            # Create permuted version in raw data
+            # We need to figure out which raw feature this processed feature came from
             permuted_df = employee_df.copy()
             
-            # Replace with median/mode (simple baseline)
-            if permuted_df[feature].dtype in ['float64', 'int64', 'float32', 'int32']:
-                permuted_df[feature] = 0  # Neutral value
-            else:
-                permuted_df[feature] = 'Unknown'
+            # Find corresponding raw feature
+            raw_feature = self._get_raw_feature_name(feature)
+            if raw_feature and raw_feature in permuted_df.columns:
+                # Permute the raw feature
+                if permuted_df[raw_feature].dtype in ['float64', 'int64', 'float32', 'int32']:
+                    permuted_df[raw_feature] = 0  # Neutral value
+                else:
+                    permuted_df[raw_feature] = 'Unknown'
             
-            try:
-                permuted_risk = self.model_engine.predict_risk_scores(permuted_df)[0]
-                contribution = baseline_risk - permuted_risk
-                contributions[feature] = contribution
-            except:
-                continue
+                try:
+                    permuted_risk = self.model_engine.predict_risk_scores(permuted_df)[0]
+                    contribution = baseline_risk - permuted_risk
+                    contributions[feature] = contribution
+                except:
+                    continue
         
         return contributions
+    
+    def _get_raw_feature_name(self, processed_feature: str) -> str:
+        """Map processed feature name back to raw feature name"""
+        # Handle different transformations
+        if processed_feature.endswith('_cap'):
+            return processed_feature[:-4]  # Remove _cap
+        elif processed_feature.endswith('_log'):
+            return processed_feature[:-4]  # Remove _log
+        elif processed_feature.endswith('_win_cap'):
+            return processed_feature[:-8]  # Remove _win_cap
+        elif processed_feature.endswith('_encoded'):
+            return processed_feature[:-8]  # Remove _encoded
+        else:
+            return processed_feature
+    
+    def _map_to_original_features(self, contributions: Dict[str, float]) -> Dict[str, float]:
+        """Map contributions from processed features to original feature names"""
+        original_contributions = {}
+        
+        for processed_feature, contrib in contributions.items():
+            original_feature = self._get_raw_feature_name(processed_feature)
+            
+            # Aggregate contributions for same original feature
+            if original_feature in original_contributions:
+                # Take the max absolute contribution
+                if abs(contrib) > abs(original_contributions[original_feature]):
+                    original_contributions[original_feature] = contrib
+            else:
+                original_contributions[original_feature] = contrib
+        
+        return original_contributions
     
     def _generate_recommendations(self, employee_df: pd.DataFrame,
                                  risk_factors: List[Dict],
