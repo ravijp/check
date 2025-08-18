@@ -156,24 +156,22 @@ class IndividualDriverAnalyzer:
                 continue
             
             # Create permuted version in raw data
-            # We need to figure out which raw feature this processed feature came from
             permuted_df = employee_df.copy()
             
             # Find corresponding raw feature
             raw_feature = self._get_raw_feature_name(feature)
             if raw_feature and raw_feature in permuted_df.columns:
-                # Permute the raw feature
-                if permuted_df[raw_feature].dtype in ['float64', 'int64', 'float32', 'int32']:
-                    permuted_df[raw_feature] = 0  # Neutral value
-                else:
+                # Permute the raw feature based on its type
+                if permuted_df[raw_feature].dtype == 'object':
+                    # Categorical - use mode or 'Unknown'
                     permuted_df[raw_feature] = 'Unknown'
+                else:
+                    # Numeric - use median or 0
+                    permuted_df[raw_feature] = 0
             
-                try:
-                    permuted_risk = self.model_engine.predict_risk_scores(permuted_df)[0]
-                    contribution = baseline_risk - permuted_risk
-                    contributions[feature] = contribution
-                except:
-                    continue
+                permuted_risk = self.model_engine.predict_risk_scores(permuted_df)[0]
+                contribution = baseline_risk - permuted_risk
+                contributions[feature] = contribution
         
         return contributions
     
@@ -223,19 +221,16 @@ class IndividualDriverAnalyzer:
         
         if salary_factors and self.causal_analyzer:
             # Use causal analyzer if available
-            try:
-                salary_effect = self.causal_analyzer.estimate_salary_intervention(
-                    employee_df, increase_pct=0.15, horizon=365
-                )
-                if salary_effect.ite_array[0] > 0:  # This employee would benefit
-                    recommendations.append({
-                        'intervention': '15% Salary Increase',
-                        'expected_risk_reduction': f"{salary_effect.ite_array[0]:.1%}",
-                        'confidence': 'High' if salary_effect.significant else 'Medium',
-                        'priority': 1 if salary_effect.ite_array[0] > 0.05 else 2
-                    })
-            except:
-                pass
+            salary_effect = self.causal_analyzer.estimate_salary_intervention(
+                employee_df, increase_pct=0.15, horizon=365
+            )
+            if salary_effect.ite_array[0] > 0:  # This employee would benefit
+                recommendations.append({
+                    'intervention': '15% Salary Increase',
+                    'expected_risk_reduction': f"{salary_effect.ite_array[0]:.1%}",
+                    'confidence': 'High' if salary_effect.significant else 'Medium',
+                    'priority': 1 if salary_effect.ite_array[0] > 0.05 else 2
+                })
         elif salary_factors:
             # Fallback without causal analyzer
             recommendations.append({
@@ -248,22 +243,19 @@ class IndividualDriverAnalyzer:
         # Check promotion-related factors
         promotion_factors = [f for f in risk_factors
                             if f['feature'] in ['time_since_last_promotion', 'promotion_velocity',
-                                               'pay_grade_stagnation_months', 'job_level']]
+                                               'pay_grade_stagnation_months', 'days_since_promot']]
         
         if promotion_factors and self.causal_analyzer:
-            try:
-                promotion_effect = self.causal_analyzer.estimate_promotion_intervention(
-                    employee_df, horizon=365
-                )
-                if promotion_effect.ite_array[0] > 0:
-                    recommendations.append({
-                        'intervention': 'Promotion',
-                        'expected_risk_reduction': f"{promotion_effect.ite_array[0]:.1%}",
-                        'confidence': 'High' if promotion_effect.significant else 'Medium',
-                        'priority': 1 if promotion_effect.ite_array[0] > 0.05 else 2
-                    })
-            except:
-                pass
+            promotion_effect = self.causal_analyzer.estimate_promotion_intervention(
+                employee_df, horizon=365
+            )
+            if promotion_effect.ite_array[0] > 0:
+                recommendations.append({
+                    'intervention': 'Promotion',
+                    'expected_risk_reduction': f"{promotion_effect.ite_array[0]:.1%}",
+                    'confidence': 'High' if promotion_effect.significant else 'Medium',
+                    'priority': 1 if promotion_effect.ite_array[0] > 0.05 else 2
+                })
         elif promotion_factors:
             recommendations.append({
                 'intervention': 'Career Development Review',
