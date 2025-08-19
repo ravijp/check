@@ -232,7 +232,7 @@ class BusinessIntelligence:
             current_level = modified_data['job_level'].iloc[0]
             
             # Handle numeric job levels only
-            if str(current_level).isdigit():
+            try:
                 numeric_level = int(current_level)
                 if numeric_level < self.config.max_job_level:
                     new_level = numeric_level + self.config.promotion_job_level_increment
@@ -242,6 +242,8 @@ class BusinessIntelligence:
                         'original': float(numeric_level),
                         'modified': float(new_level)
                     }
+            except (ValueError, TypeError):
+                logger.warning(f"Cannot process job_level: {current_level}")
         
         # Counterfactual prediction
         baseline_risk = self.model_engine.predict_risk_scores(employee_data)[0]
